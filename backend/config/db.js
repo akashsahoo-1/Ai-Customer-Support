@@ -8,6 +8,11 @@ const isProduction = process.env.NODE_ENV === 'production' ||
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: isProduction ? { rejectUnauthorized: false } : false,
+  // Prevents pool.connect() from hanging forever on Railway cold-starts or pool exhaustion.
+  // Without this, a DB hiccup = passport done() never called = HTTP request hangs.
+  connectionTimeoutMillis: 5000,  // throw after 5s instead of waiting forever
+  idleTimeoutMillis: 30000,       // release idle connections after 30s
+  max: 10,                        // cap pool size
 })
 
 pool.on('error', (err) => {
