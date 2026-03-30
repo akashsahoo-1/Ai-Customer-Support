@@ -1,13 +1,14 @@
 require('dotenv').config()
 
-// --- Startup env diagnostic (logging only, no logic) ---
-console.log('[ENV CHECK] GOOGLE_CLIENT_ID    :', process.env.GOOGLE_CLIENT_ID    ? '✅ loaded' : '❌ MISSING')
+// --- ENV CHECK ---
+console.log('[ENV CHECK] GOOGLE_CLIENT_ID    :', process.env.GOOGLE_CLIENT_ID ? '✅ loaded' : '❌ MISSING')
 console.log('[ENV CHECK] GOOGLE_CLIENT_SECRET:', process.env.GOOGLE_CLIENT_SECRET ? '✅ loaded' : '❌ MISSING')
-console.log('[ENV CHECK] GOOGLE_CALLBACK_URL :', process.env.GOOGLE_CALLBACK_URL  || '❌ MISSING')
-console.log('[ENV CHECK] FRONTEND_URL        :', process.env.FRONTEND_URL         || '❌ MISSING')
-console.log('[ENV CHECK] SESSION_SECRET      :', process.env.SESSION_SECRET       ? '✅ loaded' : '❌ MISSING')
-console.log('[ENV CHECK] DATABASE_URL        :', process.env.DATABASE_URL         ? '✅ loaded' : '❌ MISSING')
-// --------------------------------------------------------
+console.log('[ENV CHECK] GOOGLE_CALLBACK_URL :', process.env.GOOGLE_CALLBACK_URL || '❌ MISSING')
+console.log('[ENV CHECK] FRONTEND_URL        :', process.env.FRONTEND_URL || '❌ MISSING')
+console.log('[ENV CHECK] SESSION_SECRET      :', process.env.SESSION_SECRET ? '✅ loaded' : '❌ MISSING')
+console.log('[ENV CHECK] DATABASE_URL        :', process.env.DATABASE_URL ? '✅ loaded' : '❌ MISSING')
+// ------------------
+
 const express = require('express')
 const cors = require('cors')
 const helmet = require('helmet')
@@ -23,7 +24,7 @@ const adminRoutes = require('./routes/admin')
 
 const app = express()
 
-// Trust Railway's reverse proxy so secure cookies work over HTTPS
+// ✅ IMPORTANT: Trust proxy (Railway)
 app.set('trust proxy', 1)
 
 // Security
@@ -31,33 +32,34 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }))
 
-// CORS
+// ✅ CORS (FIXED)
+const allowedOrigin = process.env.FRONTEND_URL || 'http://localhost:5173'
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: allowedOrigin,
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
 }))
+
+// ✅ IMPORTANT: handle preflight (fixes hanging)
+app.options('*', cors())
 
 // Body parsing
 app.use(express.json({ limit: '10mb' }))
 app.use(express.urlencoded({ extended: true, limit: '10mb' }))
 
-// Session
-// On Railway (always HTTPS), we need secure + sameSite:none for cross-site cookies.
-// NODE_ENV alone is unreliable — check RAILWAY_ENVIRONMENT or GOOGLE_CALLBACK_URL to detect production.
-const isProduction = process.env.NODE_ENV === 'production' ||
-  (process.env.GOOGLE_CALLBACK_URL || '').startsWith('https://')
+// ✅ Session (FIXED)
+const isProduction = true // Railway = always HTTPS
 
 app.use(session({
-  secret: process.env.SESSION_SECRET || 'change-me-in-production',
+  secret: process.env.SESSION_SECRET || 'secret',
   resave: false,
   saveUninitialized: false,
+  proxy: true, // 🔥 important for Railway
   cookie: {
-    secure: isProduction,         // Must be true when sameSite:'none'
+    secure: true,          // REQUIRED
     httpOnly: true,
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-    sameSite: isProduction ? 'none' : 'lax',
+    sameSite: 'none',      // REQUIRED for cross-domain
+    maxAge: 7 * 24 * 60 * 60 * 1000,
   },
 }))
 
@@ -74,23 +76,28 @@ app.use('/api/chats', chatRoutes)
 app.use('/api/stats', statsRoutes)
 app.use('/api/admin', adminRoutes)
 
+// ✅ Root route (for testing server health)
+app.get('/', (req, res) => {
+  res.send('Server working 🚀')
+})
+
 // Health
-app.get('/api/health', (req, res) => res.json({ status: 'ok', ts: new Date().toISOString() }))
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', ts: new Date().toISOString() })
+})
 
 // Error handler
 app.use((err, req, res, next) => {
-  console.error('[ERROR]', err.message)
-  res.status(err.status || 500).json({
-    error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
-  })
+  console.error('[ERROR]', err)
+  res.status(500).json({ error: 'Internal server error' })
 })
 
-const PORT = process.env.PORT || 5000
+const PORT = process.env.PORT || 8080
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT} [${isProduction ? 'production' : 'development'}]`)
+  console.log(`🚀 Server running on port ${PORT}`)
 })
 
-// Prevent uncaught async errors from taking down the server silently
+// Prevent crash
 process.on('unhandledRejection', (reason) => {
   console.error('[UNHANDLED REJECTION]', reason)
 })
