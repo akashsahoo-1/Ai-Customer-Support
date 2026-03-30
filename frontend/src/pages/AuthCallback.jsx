@@ -8,7 +8,9 @@ export default function AuthCallback() {
   const navigate = useNavigate()
 
   useEffect(() => {
-    refetch().then(() => navigate('/dashboard', { replace: true }))
+    refetch()
+      .then(() => navigate('/dashboard', { replace: true }))
+      .catch(() => navigate('/?error=auth_failed', { replace: true }))
   }, [])
 
   return <LoadingScreen />

@@ -1,8 +1,13 @@
 const { Pool } = require('pg')
 
+// Mirror the isProduction check from index.js \u2014 Railway always runs over HTTPS
+// even if NODE_ENV is accidentally left as 'development' in the env file.
+const isProduction = process.env.NODE_ENV === 'production' ||
+  (process.env.GOOGLE_CALLBACK_URL || '').startsWith('https://')
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+  ssl: isProduction ? { rejectUnauthorized: false } : false,
 })
 
 pool.on('error', (err) => {

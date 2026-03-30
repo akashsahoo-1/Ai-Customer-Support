@@ -23,7 +23,11 @@ export function AuthProvider({ children }) {
   }
 
   function login() {
-    window.location.href = `${import.meta.env.VITE_API_URL}/auth/google`
+    // Redirects to backend /api/auth/google which triggers Google OAuth.
+    // Must use the backend (Railway) URL — NOT the Vercel frontend URL.
+    const backendUrl = import.meta.env.VITE_BACKEND_URL ||
+      (import.meta.env.VITE_API_URL || 'http://localhost:5000/api').replace(/\/api$/, '')
+    window.location.href = `${backendUrl}/api/auth/google`
   }
 
   async function logout() {
