@@ -1,26 +1,29 @@
 /**
- * rag.js — Keyword-based retrieval pipeline (no vector embeddings).
+ * rag.js — Hybrid keyword-retrieval RAG pipeline.
  *
- * Upload  : pdf-parse → split into paragraphs → save chunks (no embedding)
- * Question: lowercase keywords → score chunks → trim to ≤700 words → LLM
- * Summary : first 500 words → bullet-point prompt
- * Follow-ups: heading / entity extraction from answer (no AI call)
+ * UPLOAD  : pdf-parse → store full text as large chunks (no embeddings needed)
+ * QUESTION: keyword extraction → sentence-window scoring → top paragraphs → AI
+ * SUMMARY : first 500 words → bullet-point AI prompt
+ * FOLLOW-UPS: extract headings from doc text + answer (zero AI tokens)
  *
- * Exported API is identical to the vector version so routes/UI need no changes.
+ * Exported API matches the original vector version exactly → no route/UI changes.
  */
+
+'use strict'
 
 const Groq = require('groq-sdk')
 const { query } = require('../config/db')
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// ── Configuration ─────────────────────────────────────────────────────────────
 
-const CHUNK_CHARS   = 900   // target chars per stored chunk (≈ paragraph-sized)
-const MAX_CTX_WORDS = 700   // max words sent to LLM for a normal question
-const SUMMARY_WORDS = 500   // max words sent to LLM for a summary request
+const STORE_CHUNK_CHARS = 3000  // chars per DB chunk (keeps paragraph groups together)
+const MAX_CTX_CHARS     = 3000  // max chars sent to AI for a QA question (~600–700 words)
+const SUMMARY_MAX_CHARS = 2500  // max chars sent to AI for a summary request (~500–600 words)
+const SENTENCE_WINDOW   = 3     // sentences grouped per scored window
 
-// Words to ignore when building keyword list
+// Common English words to ignore during keyword extraction
 const STOP_WORDS = new Set([
   'what','is','the','a','an','of','in','on','at','to','for','with',
   'how','why','when','where','who','are','was','were','has','have',
@@ -28,43 +31,71 @@ const STOP_WORDS = new Set([
   'been','being','i','my','your','their','its','this','that','these',
   'those','me','him','her','us','them','and','or','but','so','if',
   'then','also','just','about','tell','give','explain','describe',
+  'please','get','any','some','all','more','much','many','very',
 ])
 
-// ── Text extraction ──────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-async function extractText(file) {
-  if (file.mimetype === 'application/pdf') {
-    try {
-      const pdfParse = require('pdf-parse')
-      const data = await pdfParse(file.buffer)
-      const text = (data.text || '').trim()
-      console.log(`[RAG] pdf-parse extracted ${text.length} chars from PDF`)
-      if (text.length > 0) return text
-      console.warn('[RAG] pdf-parse returned empty text — falling back to raw decode')
-    } catch (err) {
-      console.error('[RAG] PDF extraction error:', err.message)
-    }
-    // Fallback: best-effort latin-1 decode
-    return file.buffer
-      .toString('latin1')
-      .replace(/[^\x20-\x7E\n]/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-  }
-
-  // Plain text file
-  const text = file.buffer.toString('utf-8').trim()
-  console.log(`[RAG] TXT extracted ${text.length} chars`)
+/** Extract meaningful keywords from a user question. */
+function extractKeywords(text) {
   return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !STOP_WORDS.has(w))
 }
 
-// ── Chunking ─────────────────────────────────────────────────────────────────
+/** Escape a string for safe use in RegExp. */
+function escapeRegex(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** Detect whether the question is asking for a summary. */
+function isSummaryQuestion(question) {
+  return /\b(summary|summarize|summarise|overview|recap|brief)\b/i.test(question)
+}
+
+// ── Text Extraction ───────────────────────────────────────────────────────────
+
+async function extractText(file) {
+  try {
+    if (file.mimetype === 'application/pdf') {
+      try {
+        const pdfParse = require('pdf-parse')
+        const data = await pdfParse(file.buffer)
+        const text = (data.text || '').trim()
+        console.log(`[RAG] pdf-parse extracted ${text.length} chars from PDF`)
+        if (text.length > 0) return text
+        console.warn('[RAG] pdf-parse returned empty text — falling back to latin-1 decode')
+      } catch (err) {
+        console.error('[RAG] pdf-parse error:', err.message)
+      }
+      // Best-effort raw decode fallback
+      return file.buffer
+        .toString('latin1')
+        .replace(/[^\x20-\x7E\n]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+    }
+
+    // Plain text file
+    const text = file.buffer.toString('utf-8').trim()
+    console.log(`[RAG] TXT extracted ${text.length} chars`)
+    return text
+
+  } catch (err) {
+    console.error('[RAG] extractText error:', err.message)
+    return ''
+  }
+}
+
+// ── Chunking (store full text as large blocks) ────────────────────────────────
 
 /**
- * Splits text on blank lines (paragraph boundaries).
- * Merges short paragraphs until CHUNK_CHARS is reached.
+ * Splits text into paragraph-merged blocks of ~STORE_CHUNK_CHARS.
+ * Larger blocks = fewer DB rows + preserves context across paragraphs.
  */
-function splitIntoChunks(text) {
+function buildStorageChunks(text) {
   const paragraphs = text
     .split(/\n{2,}/)
     .map(p => p.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim())
@@ -74,43 +105,39 @@ function splitIntoChunks(text) {
   let current = ''
 
   for (const para of paragraphs) {
-    if (current.length + para.length > CHUNK_CHARS && current.length > 0) {
+    if (current.length > 0 && current.length + para.length + 2 > STORE_CHUNK_CHARS) {
       chunks.push(current.trim())
       current = para
     } else {
-      current += (current ? ' ' : '') + para
+      current += (current ? '\n\n' : '') + para
     }
   }
   if (current.trim()) chunks.push(current.trim())
 
-  console.log(`[RAG] Split into ${chunks.length} chunks`)
   return chunks
 }
 
-// ── Process & store document (no embedding) ──────────────────────────────────
+// ── Process & Store Document ──────────────────────────────────────────────────
 
 async function processDocument(docId, kbId, file) {
   try {
     console.log(`[RAG] Processing document ${docId} | type: ${file.mimetype}`)
 
-    const rawText = await extractText(file)
-    console.log(`[RAG] Extracted text length: ${rawText.length} chars`)
+    const fullText = await extractText(file)
+    console.log(`[RAG] Extracted text: ${fullText.length} chars`)
 
-    if (rawText.length === 0) {
-      console.error(`[RAG] No text extracted for ${docId} — aborting`)
+    if (fullText.length === 0) {
+      console.error(`[RAG] No text extracted for document ${docId} — aborting`)
       return
     }
 
-    const chunks = splitIntoChunks(rawText)
-    if (chunks.length === 0) {
-      console.error(`[RAG] No chunks produced for ${docId}`)
-      return
-    }
+    const chunks = buildStorageChunks(fullText)
+    console.log(`[RAG] Storing ${chunks.length} chunks for document ${docId}`)
 
     let saved = 0
     for (const chunk of chunks) {
       try {
-        // embedding column is nullable — we intentionally skip it here
+        // embedding column is nullable — intentionally omitted (no vectors needed)
         await query(
           `INSERT INTO chunks (document_id, knowledge_base_id, content)
            VALUES ($1, $2, $3)`,
@@ -118,7 +145,7 @@ async function processDocument(docId, kbId, file) {
         )
         saved++
       } catch (err) {
-        console.error(`[RAG] Error saving chunk ${saved + 1}:`, err.message)
+        console.error(`[RAG] DB error on chunk ${saved + 1}:`, err.message)
       }
     }
 
@@ -128,108 +155,170 @@ async function processDocument(docId, kbId, file) {
   }
 }
 
-// ── Keyword helpers ──────────────────────────────────────────────────────────
-
-/** Returns trimmed keywords from a question string. */
-function extractKeywords(question) {
-  return question
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, '')
-    .split(/\s+/)
-    .filter(w => w.length > 2 && !STOP_WORDS.has(w))
-}
-
-/** Trim text to at most `maxWords` words. */
-function trimToWords(text, maxWords) {
-  const words = text.split(/\s+/)
-  if (words.length <= maxWords) return text
-  return words.slice(0, maxWords).join(' ') + ' …'
-}
-
-// ── Retrieval (keyword-based) ─────────────────────────────────────────────────
+// ── Local Text Search (sentence-window scoring) ───────────────────────────────
 
 /**
- * Replaces vector search with keyword scoring.
- * Returns chunks shaped as { content, file_name } so callers (chats.js) need
- * no changes.
+ * Searches fullText locally using sliding sentence windows.
+ *
+ * Steps:
+ *  1. Split text into sentences.
+ *  2. Group into overlapping windows of SENTENCE_WINDOW sentences.
+ *  3. Score each window by total keyword hits.
+ *  4. Take the highest-scoring windows, re-sort by original position (coherent reading).
+ *  5. Join windows until maxChars is reached.
+ *
+ * Returns { text: string, found: boolean }
+ */
+function extractRelevantText(fullText, keywords, maxChars) {
+  // Normalise line breaks → split into sentences
+  const sentences = fullText
+    .replace(/\r?\n+/g, ' ')
+    .split(/(?<=[.!?])\s+(?=[A-Z])/)   // split after sentence-ending punctuation
+    .map(s => s.trim())
+    .filter(s => s.length > 10)
+
+  if (sentences.length === 0) return { text: '', found: false }
+
+  // Build sliding windows
+  const windows = []
+  for (let i = 0; i < sentences.length; i += Math.ceil(SENTENCE_WINDOW / 2)) {
+    const group = sentences.slice(i, i + SENTENCE_WINDOW)
+    const windowText = group.join(' ')
+    const lower = windowText.toLowerCase()
+    const score = keywords.reduce((acc, kw) => {
+      const hits = (lower.match(new RegExp(escapeRegex(kw), 'g')) || []).length
+      return acc + hits
+    }, 0)
+    windows.push({ text: windowText, score, index: i })
+  }
+
+  // Sort by relevance score
+  const matched = windows
+    .filter(w => w.score > 0)
+    .sort((a, b) => b.score - a.score)
+
+  if (matched.length === 0) return { text: '', found: false }
+
+  // Take top windows, re-sort by original position for readable output
+  const topWindows = matched.slice(0, 12).sort((a, b) => a.index - b.index)
+
+  // Concatenate until maxChars
+  let result = ''
+  for (const w of topWindows) {
+    if (result.length > 0 && result.length + w.text.length + 2 > maxChars) break
+    result += (result ? ' ' : '') + w.text
+  }
+
+  return { text: result.trim(), found: result.trim().length > 0 }
+}
+
+// ── Extract Document Headings ─────────────────────────────────────────────────
+
+/**
+ * Scans raw text for ALL-CAPS lines, numbered items, and markdown headings.
+ * Returns up to 8 clean topic strings.
+ */
+function extractHeadings(text) {
+  const headings = []
+  const lines = text.split('\n')
+  for (const line of lines) {
+    const t = line.replace(/^[-*•>\s\d.\)]+/, '').trim()
+    if (t.length < 4 || t.length > 100) continue
+
+    if (/^[A-Z][A-Z\s\d\-:]{3,}$/.test(t))           headings.push(t.replace(/[:\-]+$/, '').trim())
+    else if (/^[\d]+[\.\)]\s+[A-Z]\w{2,}/.test(line)) headings.push(t)
+    else if (/^#{1,3}\s+\w/.test(line))                headings.push(t.replace(/^#+\s*/, '').trim())
+
+    if (headings.length >= 8) break
+  }
+  return [...new Set(headings)]
+}
+
+/** Convert a topic string into a natural-language question. */
+function topicToQuestion(topic) {
+  const lower = topic.toLowerCase()
+  if (/^(what|who|when|where|why|how)\b/.test(lower))          return `${topic}?`
+  if (/\b(policy|policies|terms|conditions|rules|procedure)\b/i.test(topic))
+                                                                 return `What are the ${topic}?`
+  if (/\b(process|steps|method|approach)\b/i.test(topic))      return `How does ${topic} work?`
+  return `What is ${topic}?`
+}
+
+// ── Retrieval (replaces vector search, same return shape) ─────────────────────
+
+/**
+ * Loads all chunks for the KB from DB, reconstructs per-document full text,
+ * then does local keyword/sentence-window search.
+ *
+ * Returns: Array<{ content: string, file_name: string }>
+ *  — same shape as the old vector search so chats.js needs no changes.
  */
 async function searchSimilarChunks(kbId, question) {
   try {
-    const isSummary = /\b(summary|summarize|summarise|overview|recap)\b/i.test(question)
-    const keywords  = extractKeywords(question)
-    console.log(`[RAG] Mode: ${isSummary ? 'summary' : 'keyword'} | keywords: [${keywords.join(', ')}]`)
+    const summaryMode = isSummaryQuestion(question)
+    const keywords    = extractKeywords(question)
 
-    // Fetch all stored chunks for this knowledge base (order by insertion = document order)
+    console.log(`[RAG] Mode: ${summaryMode ? 'SUMMARY' : 'QA'} | keywords: [${keywords.join(', ')}]`)
+
+    // Load every chunk for this KB, ordered by document → insertion order
     const result = await query(
-      `SELECT ch.content, d.file_name
+      `SELECT ch.content, d.file_name, d.id AS doc_id
          FROM chunks ch
          JOIN documents d ON d.id = ch.document_id
         WHERE ch.knowledge_base_id = $1
-        ORDER BY ch.created_at ASC`,
+        ORDER BY d.created_at ASC, ch.created_at ASC`,
       [kbId]
     )
 
-    const allChunks = result.rows
-    console.log(`[RAG] Total chunks in KB: ${allChunks.length}`)
+    console.log(`[RAG] Loaded ${result.rows.length} chunks from DB`)
 
-    if (allChunks.length === 0) {
-      console.warn('[RAG] No chunks found — PDF may not have been processed yet')
+    if (result.rows.length === 0) {
+      console.warn('[RAG] No chunks found — document may not have been processed yet')
       return []
     }
 
-    // ── Summary mode: first N words ───────────────────────────────────────
-    if (isSummary) {
-      let wordCount = 0
-      const selected = []
-      for (const chunk of allChunks) {
-        const words = chunk.content.split(/\s+/).length
-        if (wordCount + words > SUMMARY_WORDS && selected.length > 0) break
-        selected.push(chunk)
-        wordCount += words
+    // Group chunks by document so we can search each doc separately
+    const docMap = new Map()
+    for (const row of result.rows) {
+      if (!docMap.has(row.doc_id)) {
+        docMap.set(row.doc_id, { file_name: row.file_name, parts: [] })
       }
-      console.log(`[RAG] Summary: selected ${selected.length} chunks (~${wordCount} words)`)
-      return selected
+      docMap.get(row.doc_id).parts.push(row.content)
     }
 
-    // ── Keyword mode: score & rank ────────────────────────────────────────
-    if (keywords.length === 0) {
-      // No usable keywords → return first few chunks
-      console.log('[RAG] No keywords extracted — returning first 3 chunks')
-      return allChunks.slice(0, 3)
+    const output = []
+
+    for (const [, doc] of docMap) {
+      const fullText = doc.parts.join('\n\n')
+
+      if (summaryMode) {
+        // Summary: first SUMMARY_MAX_CHARS of the document
+        const text = fullText.slice(0, SUMMARY_MAX_CHARS)
+        console.log(`[RAG] Summary: using first ${text.length} chars from "${doc.file_name}"`)
+        output.push({ content: text, file_name: doc.file_name })
+        continue
+      }
+
+      if (keywords.length === 0) {
+        // No useful keywords: return opening of document
+        console.log(`[RAG] No keywords — returning first ${MAX_CTX_CHARS} chars from "${doc.file_name}"`)
+        output.push({ content: fullText.slice(0, MAX_CTX_CHARS), file_name: doc.file_name })
+        continue
+      }
+
+      // Sentence-window keyword search
+      const { text, found } = extractRelevantText(fullText, keywords, MAX_CTX_CHARS)
+
+      if (found) {
+        console.log(`[RAG] Found ${text.length} chars of relevant text in "${doc.file_name}"`)
+        output.push({ content: text, file_name: doc.file_name })
+      } else {
+        console.warn(`[RAG] No keyword match in "${doc.file_name}"`)
+      }
     }
 
-    const scored = allChunks.map(chunk => {
-      const lower = chunk.content.toLowerCase()
-      const score = keywords.reduce((acc, kw) => {
-        const hits = (lower.match(new RegExp(kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length
-        return acc + hits
-      }, 0)
-      return { ...chunk, score }
-    })
-
-    // Keep only chunks that matched at least one keyword, sorted best-first
-    const ranked = scored
-      .filter(c => c.score > 0)
-      .sort((a, b) => b.score - a.score)
-
-    // Fall back to document-order first chunks if nothing matched
-    const candidates = ranked.length > 0 ? ranked : allChunks.slice(0, 3)
-
-    // Trim to MAX_CTX_WORDS total
-    let wordCount = 0
-    const selected = []
-    for (const chunk of candidates) {
-      const words = chunk.content.split(/\s+/).length
-      if (wordCount + words > MAX_CTX_WORDS && selected.length > 0) break
-      selected.push(chunk)
-      wordCount += words
-    }
-
-    console.log(`[RAG] Retrieved ${selected.length} chunks (~${wordCount} words)`)
-    selected.forEach((c, i) =>
-      console.log(`[RAG]   chunk[${i + 1}] score=${c.score ?? 0} file=${c.file_name}`)
-    )
-    return selected
+    console.log(`[RAG] Returning ${output.length} result(s) to caller`)
+    return output
 
   } catch (err) {
     console.error('[RAG] searchSimilarChunks error:', err.message)
@@ -237,33 +326,42 @@ async function searchSimilarChunks(kbId, question) {
   }
 }
 
-// ── Answer generation ────────────────────────────────────────────────────────
+// ── Zero-token fallback stream ────────────────────────────────────────────────
+
+/**
+ * Returns an async generator that mimics a Groq stream but emits a single
+ * fixed message. Used when no relevant context is found — avoids an AI call.
+ */
+async function* staticStream(text) {
+  yield { choices: [{ delta: { content: text } }] }
+}
+
+// ── Answer Generation ─────────────────────────────────────────────────────────
 
 async function generateAnswer(question, chunks, chatHistory = []) {
   try {
-    const isSummary = /\b(summary|summarize|summarise|overview|recap)\b/i.test(question)
+    const summaryMode = isSummaryQuestion(question)
+    const contextText = chunks.map(c => c.content).join('\n\n').trim()
 
-    const contextText = chunks.length > 0
-      ? chunks.map(c => c.content).join('\n\n')
-      : ''
+    console.log(`[RAG] generateAnswer | mode: ${summaryMode ? 'SUMMARY' : 'QA'} | context: ${contextText.length} chars | chunks: ${chunks.length}`)
 
-    // Guard: if there is truly no context, tell the user rather than hallucinating
-    if (contextText.trim().length === 0) {
-      console.warn('[RAG] No context text available — returning empty-context stream')
+    // ── No context → short-circuit without an AI call ────────────────────
+    if (contextText.length === 0) {
+      console.warn('[RAG] No context available — returning static fallback (0 tokens used)')
+      return staticStream('Not found in document.')
     }
 
-    console.log(`[RAG] Generating answer (${isSummary ? 'summary' : 'QA'}) with ${chunks.length} chunks`)
-
+    // ── Build prompt ──────────────────────────────────────────────────────
     let systemContent
-    if (isSummary) {
+
+    if (summaryMode) {
       systemContent =
-        `Summarize the following document content in clear bullet points. Be concise and cover the main points.\n\n` +
-        `Content:\n${contextText}`
+        `Summarize this document in simple bullet points:\n\n${contextText}`
     } else {
       systemContent =
-        `You are an AI assistant. Answer ONLY from the provided context below.\n` +
-        `If the answer is not found in the context, say "Not found in document".\n` +
-        `Do NOT make up information. Be concise.\n\n` +
+        `You are an AI assistant.\n` +
+        `Answer ONLY using the provided context.\n` +
+        `If the answer is not found, say "Not found in document".\n\n` +
         `Context:\n${contextText}`
     }
 
@@ -274,79 +372,51 @@ async function generateAnswer(question, chunks, chatHistory = []) {
     ]
 
     return groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
+      model:       'llama-3.3-70b-versatile',
       messages,
-      stream: true,
+      stream:      true,
       temperature: 0.2,
-      max_tokens: 1024,
+      max_tokens:  1024,
     })
 
   } catch (err) {
     console.error('[RAG] generateAnswer error:', err.message)
-    throw err
+    // Return a static fallback — never let the route crash
+    return staticStream('Sorry, I encountered an error generating the response. Please try again.')
   }
 }
 
-// ── Suggested questions (no AI) ──────────────────────────────────────────────
+// ── Suggested Questions (no AI) ───────────────────────────────────────────────
 
 /**
- * Extracts topic-based follow-up questions from the AI answer without making
- * any additional API call.
+ * Generates follow-up questions without any AI call.
  *
- * Strategy:
- *  1. Pull ALL-CAPS lines, numbered-list items, or markdown headings from the answer.
- *  2. If none found, grab capitalised noun phrases (e.g. "Payment Terms", "Refund Policy").
- *  3. Convert them to natural questions.
+ * 1. Tries to extract structured headings from the AI answer (markdown, bold, caps, numbered).
+ * 2. Falls back to capitalised noun phrases in the answer.
+ * 3. Converts topics to natural questions.
  */
 async function generateFollowUps(question, answer) {
   try {
-    const lines   = answer.split('\n')
-    const topics  = []
+    // Extract headings from the answer text
+    const fromAnswer = extractHeadings(answer)
 
-    for (const line of lines) {
-      const t = line.replace(/^[-*•>\s]+/, '').trim()   // strip list markers
-      if (t.length < 5 || t.length > 120) continue
+    // Also try bold-markdown topics inside the answer
+    const boldTopics = []
+    const boldMatches = answer.matchAll(/\*\*([^*]{4,60})\*\*/g)
+    for (const m of boldMatches) boldTopics.push(m[1].trim())
 
-      // ALL-CAPS heading  (e.g. "TERMS AND CONDITIONS")
-      if (/^[A-Z][A-Z\s\d\-:]{4,}$/.test(t)) {
-        topics.push(t.replace(/[:\-]+$/, '').trim())
-        continue
-      }
-      // Numbered item  (e.g. "1. Eligibility" or "2) Payment")
-      if (/^[\d]+[\.\)]\s+\w/.test(t)) {
-        topics.push(t.replace(/^[\d]+[\.\)\s]+/, '').trim())
-        continue
-      }
-      // Markdown heading  (e.g. "## Refund Policy")
-      if (/^#{1,3}\s+\w/.test(t)) {
-        topics.push(t.replace(/^#+\s*/, '').trim())
-        continue
-      }
-      // Bold markdown  (e.g. "**Delivery time**")
-      const bold = t.match(/\*\*([^*]{4,60})\*\*/)
-      if (bold) {
-        topics.push(bold[1].trim())
-        continue
-      }
-    }
+    // Noun phrase fallback
+    const nounPhrases = answer.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3}\b/g) || []
 
-    // Fallback: pull capitalised noun phrases from the answer body
-    if (topics.length === 0) {
-      const phrases = answer.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b/g) || []
-      topics.push(...phrases.slice(0, 6))
-    }
+    // Merge and de-duplicate, prioritising structured headings
+    const allTopics = [...fromAnswer, ...boldTopics, ...nounPhrases]
+    const unique = [...new Set(allTopics)]
+      .filter(t => t.length > 3 && t.length < 100)
+      .slice(0, 5)
 
-    // Deduplicate and build questions
-    const unique = [...new Set(topics)].slice(0, 5)
     if (unique.length === 0) return []
 
-    return unique.map(topic => {
-      const lower = topic.toLowerCase()
-      if (/^(what|who|when|where|why|how)\b/.test(lower)) return `${topic}?`
-      if (/\b(policy|policies|terms|conditions|rules)\b/i.test(topic))
-        return `What are the ${topic}?`
-      return `What is ${topic}?`
-    })
+    return unique.map(topicToQuestion)
 
   } catch (err) {
     console.error('[RAG] generateFollowUps error:', err.message)
@@ -354,6 +424,6 @@ async function generateFollowUps(question, answer) {
   }
 }
 
-// ── Exports ──────────────────────────────────────────────────────────────────
+// ── Exports ───────────────────────────────────────────────────────────────────
 
 module.exports = { processDocument, searchSimilarChunks, generateAnswer, generateFollowUps }
