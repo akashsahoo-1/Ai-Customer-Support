@@ -2,20 +2,25 @@ const router = require('express').Router()
 const passport = require('passport')
 const { requireAuth } = require('../middleware/auth')
 
-// Start Google OAuth
-router.get('/google', passport.authenticate('google', {
-  scope: ['profile', 'email'],
-}))
+// ✅ TEST ROUTE (DEBUG)
+router.get('/test', (req, res) => {
+  res.send('Auth route working ✅')
+})
 
-// Google callback — custom callback guarantees a response is always sent
+// ✅ Start Google OAuth
+router.get('/google',
+  passport.authenticate('google', {
+    scope: ['profile', 'email'],
+  })
+)
+
+// ✅ Google Callback
 router.get('/google/callback',
   (req, res, next) => {
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173'
 
-    // Safety net: if passport never calls back (e.g. DB hangs past its own timeout),
-    // this fires after 8s and sends a redirect so the request never hangs.
     const safetyTimer = setTimeout(() => {
-      console.error('[Google OAuth] Callback timed out — no response sent after 8s')
+      console.error('[Google OAuth] Timeout')
       if (!res.headersSent) {
         res.redirect(`${frontendUrl}/?error=auth_timeout`)
       }
@@ -25,34 +30,35 @@ router.get('/google/callback',
       clearTimeout(safetyTimer)
 
       if (err) {
-        console.error('[Google OAuth] Strategy error:', err.message)
+        console.error('[Google OAuth] Error:', err.message)
         return res.redirect(`${frontendUrl}/?error=auth_failed`)
       }
 
       if (!user) {
-        console.warn('[Google OAuth] No user returned:', info)
+        console.warn('[Google OAuth] No user:', info)
         return res.redirect(`${frontendUrl}/?error=auth_failed`)
       }
 
       req.logIn(user, (loginErr) => {
         if (loginErr) {
-          console.error('[Google OAuth] Session login error:', loginErr.message)
+          console.error('[Google OAuth] Login error:', loginErr.message)
           return res.redirect(`${frontendUrl}/?error=auth_failed`)
         }
-        console.log('[Google OAuth] Login success:', user.email)
+
+        console.log('[Google OAuth] Success:', user.email)
         return res.redirect(`${frontendUrl}/auth/callback`)
       })
     })(req, res, next)
   }
 )
 
-// Get current user
+// ✅ Get current user
 router.get('/me', requireAuth, (req, res) => {
   const { id, google_id, name, email, avatar, role, created_at } = req.user
   res.json({ user: { id, name, email, avatar, role, created_at } })
 })
 
-// Logout
+// ✅ Logout
 router.post('/logout', (req, res) => {
   req.logout(() => {
     req.session.destroy()
