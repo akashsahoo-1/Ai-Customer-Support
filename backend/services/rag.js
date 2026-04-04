@@ -60,22 +60,14 @@ function isSummaryQuestion(question) {
 async function extractText(file) {
   try {
     if (file.mimetype === 'application/pdf') {
-      try {
-        const pdfParse = require('pdf-parse')
-        const data = await pdfParse(file.buffer)
-        const text = (data.text || '').trim()
-        console.log(`[RAG] pdf-parse extracted ${text.length} chars from PDF`)
-        if (text.length > 0) return text
-        console.warn('[RAG] pdf-parse returned empty text — falling back to latin-1 decode')
-      } catch (err) {
-        console.error('[RAG] pdf-parse error:', err.message)
-      }
-      // Best-effort raw decode fallback
-      return file.buffer
-        .toString('latin1')
-        .replace(/[^\x20-\x7E\n]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
+      const pdfParse = require('pdf-parse')
+      const data = await pdfParse(file.buffer)
+      const text = (data.text || '').trim()
+      console.log(`[RAG] pdf-parse extracted ${text.length} chars from PDF`)
+      if (text.length > 0) return text
+      // pdf-parse returned nothing — do NOT fall back to binary decode
+      console.error('[RAG] pdf-parse returned empty text — PDF may be scanned/image-only')
+      return ''
     }
 
     // Plain text file
@@ -87,6 +79,23 @@ async function extractText(file) {
     console.error('[RAG] extractText error:', err.message)
     return ''
   }
+}
+
+// ── Text sanitization ─────────────────────────────────────────────────────────
+
+/**
+ * Strips non-printable / non-UTF-8 characters from extracted text.
+ * This is a safety net — no binary data should ever reach the DB or the AI.
+ */
+function sanitizeText(text) {
+  return text
+    // Remove null bytes and other control characters except \t \n \r
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    // Collapse sequences of non-ASCII junk (e.g. leftover encoding artifacts)
+    .replace(/[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]+/g, ' ')
+    // Collapse runs of whitespace to single space (preserve newlines)
+    .replace(/[^\S\n]+/g, ' ')
+    .trim()
 }
 
 // ── Chunking (store full text as large blocks) ────────────────────────────────
@@ -123,11 +132,18 @@ async function processDocument(docId, kbId, file) {
   try {
     console.log(`[RAG] Processing document ${docId} | type: ${file.mimetype}`)
 
-    const fullText = await extractText(file)
-    console.log(`[RAG] Extracted text: ${fullText.length} chars`)
+    const rawText = await extractText(file)
+    if (rawText.length === 0) {
+      console.error(`[RAG] No text extracted for document ${docId} — PDF may be image-only or corrupt. Aborting.`)
+      return
+    }
 
-    if (fullText.length === 0) {
-      console.error(`[RAG] No text extracted for document ${docId} — aborting`)
+    // Sanitize before storing — ensure no binary data enters the DB
+    const fullText = sanitizeText(rawText)
+    console.log(`[RAG] Extracted: ${rawText.length} chars | After sanitize: ${fullText.length} chars`)
+
+    if (fullText.length < 50) {
+      console.error(`[RAG] Sanitized text too short (${fullText.length} chars) — likely not readable text. Aborting.`)
       return
     }
 
@@ -342,7 +358,10 @@ async function* staticStream(text) {
 async function generateAnswer(question, chunks, chatHistory = []) {
   try {
     const summaryMode = isSummaryQuestion(question)
-    const contextText = chunks.map(c => c.content).join('\n\n').trim()
+
+    // Sanitize context BEFORE sending to AI — absolute guarantee: no binary data
+    const rawContext = chunks.map(c => c.content).join('\n\n').trim()
+    const contextText = sanitizeText(rawContext)
 
     console.log(`[RAG] generateAnswer | mode: ${summaryMode ? 'SUMMARY' : 'QA'} | context: ${contextText.length} chars | chunks: ${chunks.length}`)
 
