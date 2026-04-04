@@ -38,23 +38,22 @@ function splitIntoChunks(text) {
 async function extractText(file) {
   if (file.mimetype === 'application/pdf') {
     try {
-      const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js')
-      pdfjsLib.GlobalWorkerOptions.workerSrc = false
-      const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(file.buffer) })
-      const pdf = await loadingTask.promise
-      let fullText = ''
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i)
-        const content = await page.getTextContent()
-        fullText += content.items.map(item => item.str).join(' ') + '\n'
-      }
-      return fullText
+      const pdfParse = require('pdf-parse')
+      const data = await pdfParse(file.buffer)
+      const text = data.text || ''
+      console.log(`[RAG] pdf-parse extracted ${text.length} chars from PDF`)
+      if (text.trim().length > 0) return text
+      // Fallback: raw buffer decode if pdf-parse returns empty
+      console.warn('[RAG] pdf-parse returned empty text, falling back to raw decode')
+      return file.buffer.toString('latin1').replace(/[^\x20-\x7E\n]/g, ' ').replace(/\s+/g, ' ').trim()
     } catch (err) {
       console.error('[RAG] PDF extraction error:', err.message)
       return file.buffer.toString('latin1').replace(/[^\x20-\x7E\n]/g, ' ').replace(/\s+/g, ' ').trim()
     }
   }
-  return file.buffer.toString('utf-8')
+  const text = file.buffer.toString('utf-8')
+  console.log(`[RAG] TXT extracted ${text.length} chars`)
+  return text
 }
 
 async function getEmbedding(texts, inputType = 'search_document') {
@@ -67,15 +66,26 @@ async function getEmbedding(texts, inputType = 'search_document') {
 }
 
 async function processDocument(docId, kbId, file) {
-  console.log(`[RAG] Processing document ${docId}`)
+  console.log(`[RAG] Processing document ${docId} | type: ${file.mimetype}`)
   const rawText = await extractText(file)
-  console.log(`[RAG] Extracted ${rawText.length} chars`)
+  console.log(`[RAG] Extracted text length: ${rawText.length} chars`)
+
+  if (rawText.trim().length === 0) {
+    console.error(`[RAG] No text extracted from document ${docId} — aborting chunk/embed`)
+    return
+  }
 
   const chunks = splitIntoChunks(rawText)
-  console.log(`[RAG] Split into ${chunks.length} chunks`)
+  console.log(`[RAG] Number of chunks created: ${chunks.length}`)
 
-  // Batch embed all chunks at once (Cohere supports batching)
+  if (chunks.length === 0) {
+    console.error(`[RAG] No chunks produced for document ${docId}`)
+    return
+  }
+
+  // Batch embed all chunks (Cohere supports up to 96 per call)
   const batchSize = 96
+  let totalEmbedded = 0
   for (let i = 0; i < chunks.length; i += batchSize) {
     const batch = chunks.slice(i, i + batchSize)
     try {
@@ -87,16 +97,19 @@ async function processDocument(docId, kbId, file) {
            VALUES ($1, $2, $3, $4::vector)`,
           [docId, kbId, batch[j], vectorStr]
         )
+        totalEmbedded++
+        console.log(`[RAG] Embedding created for chunk ${totalEmbedded} (batch ${Math.floor(i / batchSize) + 1})`)
       }
     } catch (err) {
-      console.error(`[RAG] Error processing batch at ${i}:`, err.message)
+      console.error(`[RAG] Error processing batch at index ${i}:`, err.message)
     }
   }
 
-  console.log(`[RAG] Done processing document ${docId}`)
+  console.log(`[RAG] Done processing document ${docId} — total chunks embedded: ${totalEmbedded}`)
 }
 
 async function searchSimilarChunks(kbId, question, topK = 5) {
+  console.log(`[RAG] Generating query embedding for: "${question.substring(0, 80)}..."`)
   const embeddings = await getEmbedding([question], 'search_query')
   const vectorStr = `[${embeddings[0].join(',')}]`
 
@@ -110,22 +123,32 @@ async function searchSimilarChunks(kbId, question, topK = 5) {
      LIMIT $3`,
     [vectorStr, kbId, topK]
   )
+  console.log(`[RAG] Retrieved ${result.rows.length} chunks for kbId=${kbId}`)
+  if (result.rows.length > 0) {
+    result.rows.forEach((r, i) =>
+      console.log(`[RAG]   chunk[${i + 1}] similarity=${(+r.similarity).toFixed(4)} file=${r.file_name}`)
+    )
+  } else {
+    console.warn(`[RAG] No chunks found — PDF may not have been processed yet or KB is empty`)
+  }
   return result.rows
 }
 
 async function generateAnswer(question, chunks, chatHistory = []) {
-  const context = chunks
-    .map((c, i) => `[Source ${i + 1}: ${c.file_name}]\n${c.content}`)
-    .join('\n\n---\n\n')
+  const context = chunks.length > 0
+    ? chunks.map((c, i) => `[Source ${i + 1}: ${c.file_name}]\n${c.content}`).join('\n\n---\n\n')
+    : 'No relevant context found.'
+
+  console.log(`[RAG] Generating answer with ${chunks.length} context chunks`)
 
   const messages = [
     {
       role: 'system',
-      content: `You are a helpful customer support agent. Answer questions based ONLY on the provided context documents.
-If the answer is not in the context, say "I couldn't find information about that in the available documents."
-Be concise, accurate, and friendly. Always cite which document you found the information in.
+      content: `You are an AI assistant. Answer ONLY from the provided context below.
+If the answer is not found in the context, say "Not found in document".
+Do NOT make up information. Be concise and cite which source document you used.
 
-CONTEXT:
+Context:
 ${context}`,
     },
     ...chatHistory.slice(-6).map(m => ({ role: m.role, content: m.content })),
