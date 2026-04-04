@@ -19,19 +19,19 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
 // ── Configuration ─────────────────────────────────────────────────────────────
 
 const STORE_CHUNK_CHARS = 3000  // chars per DB chunk (keeps paragraph groups together)
-const MAX_CTX_CHARS     = 3000  // max chars sent to AI for a QA question (~600–700 words)
+const MAX_CTX_CHARS = 3000  // max chars sent to AI for a QA question (~600–700 words)
 const SUMMARY_MAX_CHARS = 2500  // max chars sent to AI for a summary request (~500–600 words)
-const SENTENCE_WINDOW   = 3     // sentences grouped per scored window
+const SENTENCE_WINDOW = 3     // sentences grouped per scored window
 
 // Common English words to ignore during keyword extraction
 const STOP_WORDS = new Set([
-  'what','is','the','a','an','of','in','on','at','to','for','with',
-  'how','why','when','where','who','are','was','were','has','have',
-  'had','do','does','did','can','could','should','would','will','be',
-  'been','being','i','my','your','their','its','this','that','these',
-  'those','me','him','her','us','them','and','or','but','so','if',
-  'then','also','just','about','tell','give','explain','describe',
-  'please','get','any','some','all','more','much','many','very',
+  'what', 'is', 'the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'with',
+  'how', 'why', 'when', 'where', 'who', 'are', 'was', 'were', 'has', 'have',
+  'had', 'do', 'does', 'did', 'can', 'could', 'should', 'would', 'will', 'be',
+  'been', 'being', 'i', 'my', 'your', 'their', 'its', 'this', 'that', 'these',
+  'those', 'me', 'him', 'her', 'us', 'them', 'and', 'or', 'but', 'so', 'if',
+  'then', 'also', 'just', 'about', 'tell', 'give', 'explain', 'describe',
+  'please', 'get', 'any', 'some', 'all', 'more', 'much', 'many', 'very',
 ])
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -155,6 +155,7 @@ async function processDocument(docId, kbId, file) {
   }
 }
 
+
 // ── Local Text Search (sentence-window scoring) ───────────────────────────────
 
 /**
@@ -225,9 +226,9 @@ function extractHeadings(text) {
     const t = line.replace(/^[-*•>\s\d.\)]+/, '').trim()
     if (t.length < 4 || t.length > 100) continue
 
-    if (/^[A-Z][A-Z\s\d\-:]{3,}$/.test(t))           headings.push(t.replace(/[:\-]+$/, '').trim())
+    if (/^[A-Z][A-Z\s\d\-:]{3,}$/.test(t)) headings.push(t.replace(/[:\-]+$/, '').trim())
     else if (/^[\d]+[\.\)]\s+[A-Z]\w{2,}/.test(line)) headings.push(t)
-    else if (/^#{1,3}\s+\w/.test(line))                headings.push(t.replace(/^#+\s*/, '').trim())
+    else if (/^#{1,3}\s+\w/.test(line)) headings.push(t.replace(/^#+\s*/, '').trim())
 
     if (headings.length >= 8) break
   }
@@ -237,10 +238,10 @@ function extractHeadings(text) {
 /** Convert a topic string into a natural-language question. */
 function topicToQuestion(topic) {
   const lower = topic.toLowerCase()
-  if (/^(what|who|when|where|why|how)\b/.test(lower))          return `${topic}?`
+  if (/^(what|who|when|where|why|how)\b/.test(lower)) return `${topic}?`
   if (/\b(policy|policies|terms|conditions|rules|procedure)\b/i.test(topic))
-                                                                 return `What are the ${topic}?`
-  if (/\b(process|steps|method|approach)\b/i.test(topic))      return `How does ${topic} work?`
+    return `What are the ${topic}?`
+  if (/\b(process|steps|method|approach)\b/i.test(topic)) return `How does ${topic} work?`
   return `What is ${topic}?`
 }
 
@@ -256,7 +257,7 @@ function topicToQuestion(topic) {
 async function searchSimilarChunks(kbId, question) {
   try {
     const summaryMode = isSummaryQuestion(question)
-    const keywords    = extractKeywords(question)
+    const keywords = extractKeywords(question)
 
     console.log(`[RAG] Mode: ${summaryMode ? 'SUMMARY' : 'QA'} | keywords: [${keywords.join(', ')}]`)
 
@@ -372,11 +373,11 @@ async function generateAnswer(question, chunks, chatHistory = []) {
     ]
 
     return groq.chat.completions.create({
-      model:       'llama-3.3-70b-versatile',
+      model: 'llama-3.3-70b-versatile',
       messages,
-      stream:      true,
+      stream: true,
       temperature: 0.2,
-      max_tokens:  1024,
+      max_tokens: 1024,
     })
 
   } catch (err) {
