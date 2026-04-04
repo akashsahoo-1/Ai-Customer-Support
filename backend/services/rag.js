@@ -18,10 +18,9 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
-const STORE_CHUNK_CHARS = 3000  // chars per DB chunk (keeps paragraph groups together)
-const MAX_CTX_CHARS = 3000  // max chars sent to AI for a QA question (~600–700 words)
-const SUMMARY_MAX_CHARS = 2500  // max chars sent to AI for a summary request (~500–600 words)
-const SENTENCE_WINDOW = 3     // sentences grouped per scored window
+const CHUNK_SIZE = 700          // chars per stored chunk (readable, scored individually)
+const TOP_K = 5                 // top chunks to return for a QA question
+const SUMMARY_CHUNKS = 3        // number of first chunks used for summary
 
 // Common English words to ignore during keyword extraction
 const STOP_WORDS = new Set([
@@ -89,39 +88,45 @@ async function extractText(file) {
  */
 function sanitizeText(text) {
   return text
-    // Remove null bytes and other control characters except \t \n \r
+    // Remove null bytes and control characters (keep \t \n \r)
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
-    // Collapse sequences of non-ASCII junk (e.g. leftover encoding artifacts)
+    // Remove non-UTF-8 / binary artifact sequences
     .replace(/[^\x09\x0A\x0D\x20-\x7E\u00A0-\uFFFF]+/g, ' ')
-    // Collapse runs of whitespace to single space (preserve newlines)
+    // Remove repeated punctuation / symbols that appear in garbled PDFs
+    .replace(/([^\w\s]){3,}/g, ' ')
+    // Collapse runs of spaces (preserve newlines)
     .replace(/[^\S\n]+/g, ' ')
     .trim()
 }
 
-// ── Chunking (store full text as large blocks) ────────────────────────────────
+// ── Chunking (700-char readable chunks) ──────────────────────────────────────
 
 /**
- * Splits text into paragraph-merged blocks of ~STORE_CHUNK_CHARS.
- * Larger blocks = fewer DB rows + preserves context across paragraphs.
+ * Splits clean text into fixed-size chunks of ~CHUNK_SIZE characters.
+ * Breaks on word boundaries so no word is cut in half.
+ * Each chunk is independently scoreable and human-readable.
  */
 function buildStorageChunks(text) {
-  const paragraphs = text
+  // Flatten to single-spaced lines (preserves paragraph breaks as spaces)
+  const flat = text
     .split(/\n{2,}/)
     .map(p => p.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim())
-    .filter(p => p.length > 20)
+    .filter(p => p.length > 10)
+    .join(' ')
 
   const chunks = []
+  const words = flat.split(' ')
   let current = ''
 
-  for (const para of paragraphs) {
-    if (current.length > 0 && current.length + para.length + 2 > STORE_CHUNK_CHARS) {
+  for (const word of words) {
+    if (current.length + word.length + 1 > CHUNK_SIZE && current.length > 0) {
       chunks.push(current.trim())
-      current = para
+      current = word
     } else {
-      current += (current ? '\n\n' : '') + para
+      current += (current ? ' ' : '') + word
     }
   }
-  if (current.trim()) chunks.push(current.trim())
+  if (current.trim().length > 10) chunks.push(current.trim())
 
   return chunks
 }
@@ -172,61 +177,40 @@ async function processDocument(docId, kbId, file) {
 }
 
 
-// ── Local Text Search (sentence-window scoring) ───────────────────────────────
+// ── Smart Chunk Scoring (keyword-match, top-K) ────────────────────────────────
 
 /**
- * Searches fullText locally using sliding sentence windows.
+ * Scores each chunk by how many keywords it contains (simple include check).
+ * Returns the top TOP_K chunks sorted back into document order.
  *
- * Steps:
- *  1. Split text into sentences.
- *  2. Group into overlapping windows of SENTENCE_WINDOW sentences.
- *  3. Score each window by total keyword hits.
- *  4. Take the highest-scoring windows, re-sort by original position (coherent reading).
- *  5. Join windows until maxChars is reached.
- *
- * Returns { text: string, found: boolean }
+ * Returns { chunks: string[], found: boolean }
  */
-function extractRelevantText(fullText, keywords, maxChars) {
-  // Normalise line breaks → split into sentences
-  const sentences = fullText
-    .replace(/\r?\n+/g, ' ')
-    .split(/(?<=[.!?])\s+(?=[A-Z])/)   // split after sentence-ending punctuation
-    .map(s => s.trim())
-    .filter(s => s.length > 10)
-
-  if (sentences.length === 0) return { text: '', found: false }
-
-  // Build sliding windows
-  const windows = []
-  for (let i = 0; i < sentences.length; i += Math.ceil(SENTENCE_WINDOW / 2)) {
-    const group = sentences.slice(i, i + SENTENCE_WINDOW)
-    const windowText = group.join(' ')
-    const lower = windowText.toLowerCase()
+function scoreChunks(allChunks, keywords) {
+  const scored = allChunks.map((chunk, index) => {
+    const lower = chunk.toLowerCase()
     const score = keywords.reduce((acc, kw) => {
-      const hits = (lower.match(new RegExp(escapeRegex(kw), 'g')) || []).length
-      return acc + hits
+      // Full-word match scores 2, substring match scores 1
+      const fullWord = new RegExp(`\\b${escapeRegex(kw)}\\b`, 'g')
+      const fullHits = (lower.match(fullWord) || []).length
+      const anyHits  = (lower.match(new RegExp(escapeRegex(kw), 'g')) || []).length
+      return acc + fullHits * 2 + (anyHits - fullHits)
     }, 0)
-    windows.push({ text: windowText, score, index: i })
-  }
+    return { chunk, score, index }
+  })
 
-  // Sort by relevance score
-  const matched = windows
-    .filter(w => w.score > 0)
+  // Take chunks with score > 0, best first; fall back to first TOP_K if nothing matched
+  const matched = scored
+    .filter(c => c.score > 0)
     .sort((a, b) => b.score - a.score)
+    .slice(0, TOP_K)
 
-  if (matched.length === 0) return { text: '', found: false }
-
-  // Take top windows, re-sort by original position for readable output
-  const topWindows = matched.slice(0, 12).sort((a, b) => a.index - b.index)
-
-  // Concatenate until maxChars
-  let result = ''
-  for (const w of topWindows) {
-    if (result.length > 0 && result.length + w.text.length + 2 > maxChars) break
-    result += (result ? ' ' : '') + w.text
+  if (matched.length === 0) {
+    return { chunks: allChunks.slice(0, TOP_K), found: false }
   }
 
-  return { text: result.trim(), found: result.trim().length > 0 }
+  // Re-sort selected chunks by original document position (coherent reading)
+  const ordered = matched.sort((a, b) => a.index - b.index).map(c => c.chunk)
+  return { chunks: ordered, found: true }
 }
 
 // ── Extract Document Headings ─────────────────────────────────────────────────
@@ -252,32 +236,33 @@ function extractHeadings(text) {
 }
 
 /** Convert a topic string into a natural-language question. */
-function topicToQuestion(topic) {
+function topicToQuestion(topic, index) {
   const lower = topic.toLowerCase()
   if (/^(what|who|when|where|why|how)\b/.test(lower)) return `${topic}?`
   if (/\b(policy|policies|terms|conditions|rules|procedure)\b/i.test(topic))
     return `What are the ${topic}?`
   if (/\b(process|steps|method|approach)\b/i.test(topic)) return `How does ${topic} work?`
-  return `What is ${topic}?`
+  // Alternate between "What is" and "Explain" for variety
+  return index % 2 === 0 ? `What is ${topic}?` : `Explain ${topic}.`
 }
 
-// ── Retrieval (replaces vector search, same return shape) ─────────────────────
+// ── Retrieval (keyword scoring, same return shape as original vector API) ────
 
 /**
- * Loads all chunks for the KB from DB, reconstructs per-document full text,
- * then does local keyword/sentence-window search.
+ * Loads all chunks for the KB from DB, groups by document,
+ * scores each chunk by keyword match, returns top-K per document.
  *
  * Returns: Array<{ content: string, file_name: string }>
- *  — same shape as the old vector search so chats.js needs no changes.
+ *  — same shape as the old vector search → chats.js needs zero changes.
  */
 async function searchSimilarChunks(kbId, question) {
   try {
     const summaryMode = isSummaryQuestion(question)
-    const keywords = extractKeywords(question)
+    const keywords    = extractKeywords(question)
 
     console.log(`[RAG] Mode: ${summaryMode ? 'SUMMARY' : 'QA'} | keywords: [${keywords.join(', ')}]`)
 
-    // Load every chunk for this KB, ordered by document → insertion order
+    // Load every chunk for this KB in document order
     const result = await query(
       `SELECT ch.content, d.file_name, d.id AS doc_id
          FROM chunks ch
@@ -294,7 +279,7 @@ async function searchSimilarChunks(kbId, question) {
       return []
     }
 
-    // Group chunks by document so we can search each doc separately
+    // Group chunks by document
     const docMap = new Map()
     for (const row of result.rows) {
       if (!docMap.has(row.doc_id)) {
@@ -306,32 +291,28 @@ async function searchSimilarChunks(kbId, question) {
     const output = []
 
     for (const [, doc] of docMap) {
-      const fullText = doc.parts.join('\n\n')
-
       if (summaryMode) {
-        // Summary: first SUMMARY_MAX_CHARS of the document
-        const text = fullText.slice(0, SUMMARY_MAX_CHARS)
-        console.log(`[RAG] Summary: using first ${text.length} chars from "${doc.file_name}"`)
-        output.push({ content: text, file_name: doc.file_name })
+        // Summary: join first SUMMARY_CHUNKS chunks only
+        const summaryText = doc.parts.slice(0, SUMMARY_CHUNKS).join(' ')
+        console.log(`[RAG] Summary: using ${Math.min(doc.parts.length, SUMMARY_CHUNKS)} chunks from "${doc.file_name}"`)
+        output.push({ content: summaryText, file_name: doc.file_name })
         continue
       }
 
       if (keywords.length === 0) {
-        // No useful keywords: return opening of document
-        console.log(`[RAG] No keywords — returning first ${MAX_CTX_CHARS} chars from "${doc.file_name}"`)
-        output.push({ content: fullText.slice(0, MAX_CTX_CHARS), file_name: doc.file_name })
+        // No usable keywords: return first TOP_K chunks
+        const text = doc.parts.slice(0, TOP_K).join(' ')
+        console.log(`[RAG] No keywords — returning first ${TOP_K} chunks from "${doc.file_name}"`)
+        output.push({ content: text, file_name: doc.file_name })
         continue
       }
 
-      // Sentence-window keyword search
-      const { text, found } = extractRelevantText(fullText, keywords, MAX_CTX_CHARS)
+      // Smart keyword scoring across all chunks → top TOP_K
+      const { chunks: topChunks, found } = scoreChunks(doc.parts, keywords)
+      const text = topChunks.join(' ')
 
-      if (found) {
-        console.log(`[RAG] Found ${text.length} chars of relevant text in "${doc.file_name}"`)
-        output.push({ content: text, file_name: doc.file_name })
-      } else {
-        console.warn(`[RAG] No keyword match in "${doc.file_name}"`)
-      }
+      console.log(`[RAG] ${found ? 'Matched' : 'Fallback'}: ${topChunks.length} chunks from "${doc.file_name}"`)
+      output.push({ content: text, file_name: doc.file_name })
     }
 
     console.log(`[RAG] Returning ${output.length} result(s) to caller`)
@@ -401,8 +382,11 @@ async function generateAnswer(question, chunks, chatHistory = []) {
 
   } catch (err) {
     console.error('[RAG] generateAnswer error:', err.message)
-    // Return a static fallback — never let the route crash
-    return staticStream('Sorry, I encountered an error generating the response. Please try again.')
+    // Fallback: return the raw chunk content directly so the user still gets an answer
+    const fallbackText = chunks.length > 0
+      ? `Here is what I found in the document:\n\n${chunks.map(c => c.content).join('\n\n').slice(0, 1200)}`
+      : 'Not found in document.'
+    return staticStream(fallbackText)
   }
 }
 
@@ -436,7 +420,7 @@ async function generateFollowUps(question, answer) {
 
     if (unique.length === 0) return []
 
-    return unique.map(topicToQuestion)
+    return unique.map((t, i) => topicToQuestion(t, i))
 
   } catch (err) {
     console.error('[RAG] generateFollowUps error:', err.message)
