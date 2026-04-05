@@ -1,7 +1,10 @@
 /**
  * rag.js — Hybrid keyword-retrieval RAG pipeline.
  *
- * UPLOAD  : pdf-parse → store full text as large chunks (no embeddings needed)
+ * UPLOAD  : two-stage PDF extraction
+ *   Stage 1 — pdf-parse  (fast, works on text-layer PDFs)
+ *   Stage 2 — pdfjs-dist renders pages → canvas PNG → Tesseract OCR
+ *             (fallback for scanned / image-only PDFs)
  * QUESTION: intent detection → if general chat → AI directly
  *           else → keyword scoring → top paragraphs → AI
  *           if no PDF chunks found → fallback to general AI (never "Not found" spam)
@@ -12,6 +15,26 @@
  */
 
 'use strict'
+
+// ── Browser-global polyfills required by pdf-parse v2 (bundles pdfjs internally) ──
+// pdf-parse v2 expects DOMMatrix / DOMRect / DOMPoint to exist in the global scope.
+// Node.js 21 does not ship these, so we polyfill minimally before any require().
+if (typeof globalThis.DOMMatrix === 'undefined') {
+  globalThis.DOMMatrix = class DOMMatrix {
+    constructor() { this.a=1;this.b=0;this.c=0;this.d=1;this.e=0;this.f=0 }
+    static fromMatrix(m) { return new DOMMatrix() }
+  }
+}
+if (typeof globalThis.DOMRect === 'undefined') {
+  globalThis.DOMRect = class DOMRect {
+    constructor(x=0,y=0,w=0,h=0){this.x=x;this.y=y;this.width=w;this.height=h}
+  }
+}
+if (typeof globalThis.DOMPoint === 'undefined') {
+  globalThis.DOMPoint = class DOMPoint {
+    constructor(x=0,y=0,z=0,w=1){this.x=x;this.y=y;this.z=z;this.w=w}
+  }
+}
 
 const Groq = require('groq-sdk')
 const { query } = require('../config/db')
@@ -80,17 +103,113 @@ function isGeneralChat(question) {
 
 // ── Text Extraction ───────────────────────────────────────────────────────────
 
+/**
+ * Stage-2 OCR: render each PDF page to a PNG via pdfjs-dist + canvas,
+ * then run Tesseract on each image and concatenate the results.
+ *
+ * pdfjs-dist v5 is ESM-only — we load it via dynamic import() so it works
+ * inside this CJS module without needing to convert the whole project to ESM.
+ *
+ * @param {Buffer} pdfBuffer
+ * @returns {Promise<string>}  OCR text (may be empty if rendering fails)
+ */
+async function ocrPdf(pdfBuffer) {
+  // Dynamic import — pdfjs-dist v5 ships only ESM; require() won't work
+  const { getDocument, GlobalWorkerOptions } = await import('pdfjs-dist/legacy/build/pdf.mjs')
+  const { createCanvas } = require('canvas')
+  const Tesseract = require('tesseract.js')
+
+  // Disable the Web Worker (Node environment has no Worker threads for this)
+  GlobalWorkerOptions.workerSrc = ''
+
+  const loadingTask = getDocument({ data: new Uint8Array(pdfBuffer) })
+  const pdfDoc = await loadingTask.promise
+  const numPages = pdfDoc.numPages
+
+  console.log(`[RAG] OCR: rendering ${numPages} page(s) for Tesseract…`)
+
+  // Create one persistent Tesseract worker for all pages (reuse across pages = faster)
+  const worker = await Tesseract.createWorker('eng', 1, { logger: () => {} })
+
+  const pageTexts = []
+
+  try {
+    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+      try {
+        const page = await pdfDoc.getPage(pageNum)
+        const viewport = page.getViewport({ scale: 2.0 }) // 2× → better OCR accuracy
+
+        const canvas = createCanvas(viewport.width, viewport.height)
+        const ctx = canvas.getContext('2d')
+
+        // Provide a NodeCanvasFactory so pdfjs-dist can create off-screen canvases
+        const nodeCanvasFactory = {
+          create(w, h) {
+            const c = createCanvas(w, h)
+            return { canvas: c, context: c.getContext('2d') }
+          },
+          reset(cf, w, h) { cf.canvas.width = w; cf.canvas.height = h },
+          destroy() {},
+        }
+
+        await page.render({ canvasContext: ctx, viewport, canvasFactory: nodeCanvasFactory }).promise
+
+        const pngBuffer = canvas.toBuffer('image/png')
+        const { data: { text } } = await worker.recognize(pngBuffer)
+        const clean = (text || '').trim()
+        console.log(`[RAG] OCR page ${pageNum}/${numPages}: ${clean.length} chars`)
+        if (clean.length > 0) pageTexts.push(clean)
+
+      } catch (pageErr) {
+        console.error(`[RAG] OCR error on page ${pageNum}:`, pageErr.message)
+      }
+    }
+  } finally {
+    await worker.terminate()
+  }
+
+  return pageTexts.join('\n\n')
+}
+
+/**
+ * Extract readable text from an uploaded file.
+ *
+ * For PDFs:
+ *   1. Try pdf-parse (instant — works for text-layer PDFs)
+ *   2. If < 100 chars extracted → fall back to pdfjs-dist page rendering + Tesseract OCR
+ *      (covers scanned / image-only PDFs)
+ *
+ * For TXT: straight UTF-8 decode.
+ */
 async function extractText(file) {
   try {
     if (file.mimetype === 'application/pdf') {
-      const pdfParse = require('pdf-parse')
-      const data = await pdfParse(file.buffer)
-      const text = (data.text || '').trim()
-      console.log(`[RAG] pdf-parse extracted ${text.length} chars from PDF`)
-      if (text.length > 0) return text
-      // pdf-parse returned nothing — do NOT fall back to binary decode
-      console.error('[RAG] pdf-parse returned empty text — PDF may be scanned/image-only')
-      return ''
+
+      // ── Stage 1: pdf-parse (fast path) ──────────────────────────────────
+      let text = ''
+      try {
+        const pdfParse = require('pdf-parse')
+        const data = await pdfParse(file.buffer)
+        text = (data.text || '').trim()
+        console.log(`[RAG] Stage 1 — pdf-parse: ${text.length} chars`)
+      } catch (parseErr) {
+        console.warn('[RAG] pdf-parse threw:', parseErr.message, '— will try OCR')
+      }
+
+      if (text.length >= 100) {
+        console.log('[RAG] Stage 1 sufficient — skipping OCR')
+        return text
+      }
+
+      // ── Stage 2: OCR fallback ────────────────────────────────────────────
+      console.log(`[RAG] Stage 1 returned only ${text.length} chars — falling back to OCR`)
+      const ocrText = await ocrPdf(file.buffer)
+      console.log(`[RAG] Stage 2 — OCR total: ${ocrText.length} chars`)
+
+      // Return whichever source gave more content
+      const best = ocrText.length > text.length ? ocrText : text
+      console.log(`[RAG] Using ${ocrText.length > text.length ? 'OCR' : 'pdf-parse'} result (${best.length} chars)`)
+      return best
     }
 
     // Plain text file
