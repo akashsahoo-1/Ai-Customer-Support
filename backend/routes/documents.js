@@ -6,15 +6,9 @@ const { processDocument } = require('../services/rag')
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
-  fileFilter: (req, file, cb) => {
-    const allowed = ['application/pdf', 'text/plain']
-    if (allowed.includes(file.mimetype)) {
-      cb(null, true)
-    } else {
-      cb(new Error('Only PDF and TXT files are allowed'))
-    }
-  },
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  // No fileFilter — some browsers send PDFs as 'application/octet-stream'.
+  // We validate by actual content (pdf-parse) not by MIME header.
 })
 
 // GET documents for a KB

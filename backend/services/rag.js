@@ -100,9 +100,18 @@ async function extractText(file) {
     if (file.mimetype === 'application/pdf') {
       const pdfParse = require('pdf-parse')
       const data = await pdfParse(file.buffer)
-      const text = (data.text || '').trim()
-      console.log(`[RAG] pdf-parse extracted ${text.length} chars | non-whitespace: ${text.replace(/\s/g, '').length}`)
-      console.log(`[RAG] PDF TEXT PREVIEW: ${text.slice(0, 300).replace(/\n/g, ' ')}`)
+      const raw = (data.text || '')
+
+      // Collapse \r\n and repeated whitespace immediately so all downstream
+      // code works with clean single-spaced text from the start.
+      const text = raw
+        .replace(/\r\n/g, ' ')
+        .replace(/\n/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+
+      console.log(`[RAG] pdf-parse extracted ${text.length} chars`)
+      console.log(`[RAG] PDF TEXT PREVIEW: ${text.slice(0, 200)}`)
       return text
     }
 
@@ -184,22 +193,21 @@ async function processDocument(docId, kbId, file) {
     const fullText = sanitizeText(rawText)
     console.log(`[RAG] Extracted: ${rawText.length} chars | After sanitize: ${fullText.length} chars`)
 
-    // ── Validate: check real content chars (not whitespace) ───────────────────────
-    // pdf-parse output is heavily padded with \n — total char count is misleading.
-    // We count only non-whitespace chars to detect truly empty/unreadable PDFs.
-    const nonWsCount = fullText.replace(/\s/g, '').length
-    if (nonWsCount < 20) {
-      console.error(`[RAG] Non-whitespace chars: ${nonWsCount} — PDF has no readable content. Aborting.`)
-      return
-    }
-
-    // ── Flatten newlines before chunking ─────────────────────────────────────
-    // Collapse \n runs and extra spaces into single spaces so chunks are
-    // clean, readable sentences rather than fragmented newline-separated lines.
+    // ── Validate & clean ──────────────────────────────────────────────────────
+    // Flatten any remaining whitespace (sanitizeText preserves \n; collapse now).
     const cleanText = fullText
+      .replace(/\r\n/g, ' ')
       .replace(/\n+/g, ' ')
       .replace(/\s+/g, ' ')
       .trim()
+
+    console.log(`[RAG] Clean text length: ${cleanText.length}`)
+    console.log(`[RAG] TEXT SAMPLE: ${cleanText.slice(0, 200)}`)
+
+    if (cleanText.length < 30) {
+      console.error(`[RAG] Clean text too short (${cleanText.length} chars) — PDF has no readable content. Aborting.`)
+      return
+    }
 
     const chunks = buildStorageChunks(cleanText)
     console.log(`[RAG] Storing ${chunks.length} chunks for document ${docId}`)
