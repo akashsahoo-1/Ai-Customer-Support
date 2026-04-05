@@ -101,7 +101,8 @@ async function extractText(file) {
       const pdfParse = require('pdf-parse')
       const data = await pdfParse(file.buffer)
       const text = (data.text || '').trim()
-      console.log(`[RAG] pdf-parse extracted ${text.length} chars`)
+      console.log(`[RAG] pdf-parse extracted ${text.length} chars | non-whitespace: ${text.replace(/\s/g, '').length}`)
+      console.log(`[RAG] PDF TEXT PREVIEW: ${text.slice(0, 300).replace(/\n/g, ' ')}`)
       return text
     }
 
@@ -183,12 +184,24 @@ async function processDocument(docId, kbId, file) {
     const fullText = sanitizeText(rawText)
     console.log(`[RAG] Extracted: ${rawText.length} chars | After sanitize: ${fullText.length} chars`)
 
-    if (fullText.length < 100) {
-      console.error(`[RAG] Extracted text too short (${fullText.length} chars) — PDF is likely scanned/image-only. Aborting.`)
+    // ── Validate: check real content chars (not whitespace) ───────────────────────
+    // pdf-parse output is heavily padded with \n — total char count is misleading.
+    // We count only non-whitespace chars to detect truly empty/unreadable PDFs.
+    const nonWsCount = fullText.replace(/\s/g, '').length
+    if (nonWsCount < 20) {
+      console.error(`[RAG] Non-whitespace chars: ${nonWsCount} — PDF has no readable content. Aborting.`)
       return
     }
 
-    const chunks = buildStorageChunks(fullText)
+    // ── Flatten newlines before chunking ─────────────────────────────────────
+    // Collapse \n runs and extra spaces into single spaces so chunks are
+    // clean, readable sentences rather than fragmented newline-separated lines.
+    const cleanText = fullText
+      .replace(/\n+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+
+    const chunks = buildStorageChunks(cleanText)
     console.log(`[RAG] Storing ${chunks.length} chunks for document ${docId}`)
 
     let saved = 0
