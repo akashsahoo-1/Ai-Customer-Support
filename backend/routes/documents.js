@@ -44,6 +44,15 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
   if (!kbId) return res.status(400).json({ error: 'kbId required' })
   if (!req.file) return res.status(400).json({ error: 'File required' })
 
+  // ── Guard: reject obviously broken files ──────────────────────────────────
+  console.log(`[UPLOAD] file: ${req.file.originalname} | size: ${req.file.size} bytes | mime: ${req.file.mimetype}`)
+
+  if (req.file.size < 500) {
+    return res.status(400).json({
+      error: `File too small (${req.file.size} bytes) — may be corrupt or empty`,
+    })
+  }
+
   // Verify KB belongs to user
   const kbCheck = await query(
     'SELECT id FROM knowledge_bases WHERE id = $1 AND user_id = $2',
@@ -60,13 +69,34 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
     )
     const doc = docResult.rows[0]
 
-    // Process asynchronously (extract, chunk, embed, store)
-    processDocument(doc.id, kbId, req.file).catch(err => {
-      console.error('[RAG] Processing error:', err.message)
-    })
+    // ── Process synchronously so we can report success / failure ─────────────
+    // (background processing gave 0-chunk docs with no error surfaced to user)
+    await processDocument(doc.id, kbId, req.file)
 
-    res.status(201).json({ doc, message: 'Upload started, processing in background' })
+    // Check how many chunks were actually saved
+    const chunkCheck = await query(
+      'SELECT COUNT(*)::int AS cnt FROM chunks WHERE document_id = $1',
+      [doc.id]
+    )
+    const chunkCount = chunkCheck.rows[0]?.cnt ?? 0
+    console.log(`[UPLOAD] Chunks saved: ${chunkCount}`)
+
+    if (chunkCount === 0) {
+      // Clean up the orphaned document record so the user can retry
+      await query('DELETE FROM documents WHERE id = $1', [doc.id])
+      return res.status(422).json({
+        error: 'PDF was uploaded but no readable text could be extracted. '
+             + 'The file may be scanned/image-only or password-protected.',
+      })
+    }
+
+    res.status(201).json({
+      doc,
+      chunks: chunkCount,
+      message: `Processed successfully — ${chunkCount} chunks created`,
+    })
   } catch (err) {
+    console.error('[UPLOAD] Error:', err.message)
     res.status(500).json({ error: err.message })
   }
 })

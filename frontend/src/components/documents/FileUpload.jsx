@@ -147,15 +147,19 @@ export default function FileUpload({ kbId, onSuccess }) {
       formData.append('file', item.file)
       formData.append('kbId', kbId)
 
-      await api.post('/documents/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
+      // ⚠️ Do NOT set Content-Type manually — the browser must set it so it
+      // includes the multipart boundary. Without the boundary multer can't
+      // parse the body and req.file will be undefined.
+      const res = await api.post('/documents/upload', formData, {
         onUploadProgress: e => {
           const pct = Math.round((e.loaded * 80) / e.total)
           setFiles(prev => prev.map(f => f.id === id ? { ...f, progress: 10 + pct } : f))
         },
       })
+
       setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'done', progress: 100 } : f))
-      toast.success(`${item.file.name} uploaded!`)
+      const chunks = res.data?.chunks ?? '?'
+      toast.success(`${item.file.name} uploaded — ${chunks} chunks created`)
       onSuccess?.()
     } catch (err) {
       const msg = err.response?.data?.error || 'Upload failed'
