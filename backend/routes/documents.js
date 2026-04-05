@@ -44,14 +44,8 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
   if (!kbId) return res.status(400).json({ error: 'kbId required' })
   if (!req.file) return res.status(400).json({ error: 'File required' })
 
-  // ── Guard: reject obviously broken files ──────────────────────────────────
   console.log(`[UPLOAD] file: ${req.file.originalname} | size: ${req.file.size} bytes | mime: ${req.file.mimetype}`)
-
-  if (req.file.size < 500) {
-    return res.status(400).json({
-      error: `File too small (${req.file.size} bytes) — may be corrupt or empty`,
-    })
-  }
+  // allow file regardless of size — content is checked after extraction
 
   // Verify KB belongs to user
   const kbCheck = await query(
@@ -82,11 +76,12 @@ router.post('/upload', requireAuth, upload.single('file'), async (req, res) => {
     console.log(`[UPLOAD] Chunks saved: ${chunkCount}`)
 
     if (chunkCount === 0) {
-      // Clean up the orphaned document record so the user can retry
+      // Clean up the orphaned document record so the user can retry cleanly
       await query('DELETE FROM documents WHERE id = $1', [doc.id])
-      return res.status(422).json({
-        error: 'PDF was uploaded but no readable text could be extracted. '
-             + 'The file may be scanned/image-only or password-protected.',
+      return res.json({
+        success: false,
+        chunks: 0,
+        message: 'This PDF has no readable content. Please upload a proper document.',
       })
     }
 

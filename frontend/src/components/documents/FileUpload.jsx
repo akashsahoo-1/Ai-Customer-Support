@@ -157,6 +157,14 @@ export default function FileUpload({ kbId, onSuccess }) {
         },
       })
 
+      // Backend returns { success: false, message } when file has no readable text
+      if (res.data?.success === false) {
+        const msg = res.data.message || 'No readable content found in this PDF.'
+        setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'error', error: msg } : f))
+        toast.error(msg)
+        return
+      }
+
       setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'done', progress: 100 } : f))
       const chunks = res.data?.chunks ?? '?'
       toast.success(`${item.file.name} uploaded — ${chunks} chunks created`)
