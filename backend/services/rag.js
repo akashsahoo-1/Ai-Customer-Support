@@ -202,7 +202,7 @@ async function extractText(file) {
       }
 
       // ── Stage 2: OCR fallback ────────────────────────────────────────────
-      console.log(`[RAG] Stage 1 returned only ${text.length} chars — falling back to OCR`)
+      console.log(`[RAG] ⚠️ Stage 1 returned only ${text.length} chars — OCR fallback triggered`)
       const ocrText = await ocrPdf(file.buffer)
       console.log(`[RAG] Stage 2 — OCR total: ${ocrText.length} chars`)
 
@@ -290,8 +290,8 @@ async function processDocument(docId, kbId, file) {
     const fullText = sanitizeText(rawText)
     console.log(`[RAG] Extracted: ${rawText.length} chars | After sanitize: ${fullText.length} chars`)
 
-    if (fullText.length < 50) {
-      console.error(`[RAG] Sanitized text too short (${fullText.length} chars) — likely not readable text. Aborting.`)
+    if (fullText.length < 20) {
+      console.error(`[RAG] Extracted text too short (${fullText.length} chars) — aborting chunk storage`)
       return
     }
 
