@@ -2,9 +2,11 @@
  * rag.js — Hybrid keyword-retrieval RAG pipeline.
  *
  * UPLOAD  : pdf-parse → store full text as large chunks (no embeddings needed)
- * QUESTION: keyword extraction → sentence-window scoring → top paragraphs → AI
- * SUMMARY : first 500 words → bullet-point AI prompt
- * FOLLOW-UPS: extract headings from doc text + answer (zero AI tokens)
+ * QUESTION: intent detection → if general chat → AI directly
+ *           else → keyword scoring → top paragraphs → AI
+ *           if no PDF chunks found → fallback to general AI (never "Not found" spam)
+ * SUMMARY : first SUMMARY_CHUNKS chunks → bullet-point AI prompt
+ * FOLLOW-UPS: extract headings from answer (zero AI tokens)
  *
  * Exported API matches the original vector version exactly → no route/UI changes.
  */
@@ -52,6 +54,28 @@ function escapeRegex(str) {
 /** Detect whether the question is asking for a summary. */
 function isSummaryQuestion(question) {
   return /\b(summary|summarize|summarise|overview|recap|brief)\b/i.test(question)
+}
+
+/**
+ * Detect whether the question is a general / conversational message that
+ * should be handled by the AI directly without any PDF context.
+ *
+ * Triggers on:
+ *  - Common greetings / small-talk phrases
+ *  - Very short messages (< 5 chars after trimming)
+ */
+function isGeneralChat(question) {
+  const q = question.toLowerCase().trim()
+  // Short message — treat as casual
+  if (q.length < 5) return true
+  // Greeting / small-talk keywords
+  const generalPhrases = [
+    'hi', 'hello', 'hey', 'howdy', 'greetings', 'good morning', 'good afternoon',
+    'good evening', 'good night', 'how are you', 'how r u', "what's up", 'whats up',
+    'sup', 'yo', 'hiya', 'thanks', 'thank you', 'bye', 'goodbye', 'see you',
+    'nice to meet', 'who are you', 'what are you', 'what can you do', 'help me',
+  ]
+  return generalPhrases.some(phrase => q.startsWith(phrase) || q === phrase)
 }
 
 // ── Text Extraction ───────────────────────────────────────────────────────────
@@ -328,10 +352,38 @@ async function searchSimilarChunks(kbId, question) {
 
 /**
  * Returns an async generator that mimics a Groq stream but emits a single
- * fixed message. Used when no relevant context is found — avoids an AI call.
+ * fixed message. Used for hardcoded fallbacks only.
  */
 async function* staticStream(text) {
   yield { choices: [{ delta: { content: text } }] }
+}
+
+// ── General-purpose AI call (no PDF context) ──────────────────────────────────
+
+/**
+ * Calls the LLM as a plain, friendly assistant — no document context injected.
+ * Used for greetings, small-talk, and fallback when PDF has no relevant chunks.
+ */
+async function callGeneralAI(question, chatHistory = []) {
+  const messages = [
+    {
+      role: 'system',
+      content:
+        'You are a friendly, knowledgeable AI assistant. '
+        + 'Respond naturally, helpfully, and concisely. '
+        + 'If the user asks about an uploaded document, let them know you need some keywords to search it.',
+    },
+    ...chatHistory.slice(-4).map(m => ({ role: m.role, content: m.content })),
+    { role: 'user', content: question },
+  ]
+
+  return groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages,
+    stream: true,
+    temperature: 0.7,
+    max_tokens: 512,
+  })
 }
 
 // ── Answer Generation ─────────────────────────────────────────────────────────
@@ -339,30 +391,43 @@ async function* staticStream(text) {
 async function generateAnswer(question, chunks, chatHistory = []) {
   try {
     const summaryMode = isSummaryQuestion(question)
+    const generalChat  = isGeneralChat(question)
 
-    // Sanitize context BEFORE sending to AI — absolute guarantee: no binary data
+    // ── STEP 1: General chat → skip PDF context entirely ─────────────────
+    if (generalChat) {
+      console.log('[RAG] Intent: GENERAL CHAT — calling AI without PDF context')
+      return callGeneralAI(question, chatHistory)
+    }
+
+    // ── STEP 2: Sanitize retrieved PDF context ────────────────────────────
     const rawContext = chunks.map(c => c.content).join('\n\n').trim()
     const contextText = sanitizeText(rawContext)
 
     console.log(`[RAG] generateAnswer | mode: ${summaryMode ? 'SUMMARY' : 'QA'} | context: ${contextText.length} chars | chunks: ${chunks.length}`)
 
-    // ── No context → short-circuit without an AI call ────────────────────
+    // ── STEP 3: No PDF context → fall back to general AI (no "Not found" spam) ──
     if (contextText.length === 0) {
-      console.warn('[RAG] No context available — returning static fallback (0 tokens used)')
-      return staticStream('Not found in document.')
+      console.warn('[RAG] No PDF context available — falling back to general AI response')
+      return callGeneralAI(
+        `The user asked: "${question}". No document context is available. ` +
+        'Answer as helpfully as possible from your general knowledge.',
+        chatHistory
+      )
     }
 
-    // ── Build prompt ──────────────────────────────────────────────────────
+    // ── STEP 4: Build PDF-grounded prompt ────────────────────────────────
     let systemContent
 
     if (summaryMode) {
       systemContent =
-        `Summarize this document in simple bullet points:\n\n${contextText}`
+        `You are an AI assistant. Summarize the following document content in clear, simple bullet points. ` +
+        `Be concise and structured.\n\nDocument Content:\n${contextText}`
     } else {
       systemContent =
-        `You are an AI assistant.\n` +
-        `Answer ONLY using the provided context.\n` +
-        `If the answer is not found, say "Not found in document".\n\n` +
+        `You are an AI assistant helping the user with their uploaded document.\n` +
+        `Answer the question using the context below as your primary source.\n` +
+        `If the exact answer isn't in the context, share what IS relevant and then ` +
+        `supplement briefly from your general knowledge — do NOT just say "Not found in document".\n\n` +
         `Context:\n${contextText}`
     }
 
@@ -382,10 +447,10 @@ async function generateAnswer(question, chunks, chatHistory = []) {
 
   } catch (err) {
     console.error('[RAG] generateAnswer error:', err.message)
-    // Fallback: return the raw chunk content directly so the user still gets an answer
+    // ── STEP 5: Graceful fallback — always respond ────────────────────────
     const fallbackText = chunks.length > 0
-      ? `Here is what I found in the document:\n\n${chunks.map(c => c.content).join('\n\n').slice(0, 1200)}`
-      : 'Not found in document.'
+      ? `I couldn't generate a full answer, but here is relevant information from the document:\n\n${chunks.map(c => c.content).join('\n\n').slice(0, 1200)}`
+      : `I had trouble processing that. Could you rephrase your question?`
     return staticStream(fallbackText)
   }
 }
